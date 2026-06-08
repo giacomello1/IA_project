@@ -3,7 +3,7 @@ from people import Person
 from beneficiaries import Beneficiary
 from products import Product
 
-def evaluate_fitness(chromosome, beneficiaries, people, products, ben_priorities_map) -> float:
+def evaluate_fitness(chromosome, beneficiaries, people, products, ben_priorities_map, ben_req_map) -> float:
     fitness_score = 1000000.0
     product_map = {p.id: p for p in products if p.id is not None}
     total_allocated_per_product = {p.id: 0 for p in products if p.id is not None}

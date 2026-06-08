@@ -1,4 +1,5 @@
 import random
+import math
 import matplotlib.pyplot as plt
 import os
 from typing import List, Dict, Tuple
@@ -6,29 +7,80 @@ from people import Person
 from beneficiaries import Beneficiary
 from products import Product
 
-def repair_chromosome(chromosome: Dict[int, Dict[int, int]], products: List[Product]):
-    """Garantisce che nessun vincolo rigido di magazzino sia violato in modo stocastico."""
-    product_map = {p.id: p for p in products if p.id is not None}
-    total_allocated = {p.id: 0 for p in products if p.id is not None}
 
+def repair_chromosome(chromosome: Dict[int, Dict[int, int]],
+                      products: List[Product],
+                      ben_priorities_map: Dict[int, float],
+                      ben_req_map: Dict[int, int]):
+    """
+    Garantisce che nessun vincolo rigido di magazzino sia violato.
+    Utilizza un'estrazione pesata (Softmax) per rimuovere i prodotti in eccesso,
+    penalizzando gli enti con priorità più bassa e minor fabbisogno mancante.
+    """
+    product_map = {p.id: p for p in products if p.id is not None}
+    total_allocated = {}
+
+    # Calcolo totale allocato per ogni prodotto
     for ben_id, allocations in chromosome.items():
         for prod_id, qty in allocations.items():
-            if prod_id in total_allocated:
-                total_allocated[prod_id] += qty
+            if qty > 0:
+                total_allocated[prod_id] = total_allocated.get(prod_id, 0) + qty
 
     for prod_id, total_qty in total_allocated.items():
         available = product_map[prod_id].quantity
+
         if total_qty > available:
             excess = total_qty - available
-            while excess > 0:
-                eligible_bens = [b_id for b_id, allocs in chromosome.items() if allocs.get(prod_id, 0) > 0]
-                if not eligible_bens:
-                    break
-                target_ben = random.choice(eligible_bens)
+            eligible_bens = [b_id for b_id, allocs in chromosome.items() if allocs.get(prod_id, 0) > 0]
+
+            # OTTIMIZZAZIONE: Pre-calcoliamo le calorie allocate a questi enti una volta sola.
+            # Ricalcolarlo dentro il ciclo 'while' renderebbe l'algoritmo lentissimo.
+            alloc_cals_map = {}
+            for b_id in eligible_bens:
+                cals = sum(chromosome[b_id].get(p.id, 0) * p.calories for p in products if p.id in chromosome[b_id])
+                alloc_cals_map[b_id] = cals
+
+            prod_cal = product_map[prod_id].calories
+
+            while excess > 0 and eligible_bens:
+                pesi = []
+                for b_id in eligible_bens:
+                    priorita = ben_priorities_map.get(b_id, 1.0)
+                    # Evitiamo divisioni per zero se l'ente non ha persone
+                    fabbisogno_tot = max(1, ben_req_map.get(b_id, 1))
+
+                    # Fabbisogno mancante non può scendere sotto lo zero
+                    cal_allocate = alloc_cals_map[b_id]
+                    fabbisogno_mancante = max(0, fabbisogno_tot - cal_allocate)
+
+                    # FORMULA SOFTMAX RICHIESTA
+                    esponente = -priorita * (fabbisogno_mancante / fabbisogno_tot)
+
+                    # math.exp è sicurissimo qui perché 'esponente' è sempre <= 0
+                    peso = math.exp(esponente)
+                    pesi.append(peso)
+
+                # Estrazione pesata (target_ben è l'ente scelto per Cedere 1 unità)
+                target_ben = random.choices(eligible_bens, weights=pesi, k=1)[0]
+
+                # Sottrazione dell'eccesso
                 chromosome[target_ben][prod_id] -= 1
                 excess -= 1
 
-def initialize_population(pop_size: int, beneficiaries: List[Beneficiary], products: List[Product]) -> List[Dict[int, Dict[int, int]]]:
+                # Aggiorniamo al volo le calorie di questo ente per mantenere la precisione
+                # nel prossimo giro di ciclo (senza ricalcolarle tutte)
+                alloc_cals_map[target_ben] -= prod_cal
+
+                # Se l'ente non ha più quel prodotto, toglilo dai sorteggiabili
+                if chromosome[target_ben][prod_id] == 0:
+                    eligible_bens.remove(target_ben)
+
+
+def initialize_population(pop_size: int,
+                          beneficiaries: List[Beneficiary],
+                          products: List[Product],
+                          ben_priorities_map: Dict[int, float],
+                          ben_req_map: Dict[int, int]) -> List[Dict[int, Dict[int, int]]]:
     population = []
     for _ in range(pop_size):
         chromosome = {b.id: {} for b in beneficiaries}
@@ -43,7 +95,9 @@ def initialize_population(pop_size: int, beneficiaries: List[Beneficiary], produ
                     take = 1
                 chromosome[target_ben.id][prod.id] = chromosome[target_ben.id].get(prod.id, 0) + take
                 qty_to_distribute -= take
-        repair_chromosome(chromosome, products)
+
+        # Passiamo anche il fabbisogno al repair
+        repair_chromosome(chromosome, products, ben_priorities_map, ben_req_map)
         population.append(chromosome)
     return population
 
@@ -91,30 +145,56 @@ def mutate(chromosome: Dict[int, Dict[int, int]], products: List[Product], mutat
                     chromosome[ben_id][prod_id] = 0
                     chromosome[target_ben][prod_id] = chromosome[target_ben].get(prod_id, 0) + qty
 
-def run_genetic_algorithm(beneficiaries, people, products, ben_priorities_map, pop_size=150, generations=200, mutation_rate=0.05):
+
+def run_genetic_algorithm(beneficiaries, people, products, ben_priorities_map, pop_size=150, generations=100,
+                          mutation_rate=0.05):
     from fitness import evaluate_fitness
-    population = initialize_population(pop_size, beneficiaries, products)
+
+    # Mappe di supporto veloci
+    product_map = {p.id: p for p in products if p.id is not None}
+    ben_req_map = {b.id: sum(p.caloric_requirement for p in people if p.beneficiary_id == b.id) for b in beneficiaries}
+    ben_people_count = {b.id: sum(1 for p in people if p.beneficiary_id == b.id) for b in beneficiaries}
+
+    # Passiamo ben_req_map all'inizializzazione
+    population = initialize_population(pop_size, beneficiaries, products, ben_priorities_map, ben_req_map)
+
     best_chromosome = None
     best_fitness = -float('inf')
     fitness_history = []
 
     for gen in range(generations):
-        fitness_scores = [evaluate_fitness(ind, beneficiaries, people, products, ben_priorities_map) for ind in population]
+        # ASSICURATI CHE LA CHIAMATA SIA COSÌ:
+        fitness_scores = [
+            evaluate_fitness(ind, beneficiaries, people, products, ben_priorities_map, ben_req_map)
+            for ind in population
+        ]
+
         current_best_idx = max(range(pop_size), key=lambda idx: fitness_scores[idx])
         current_best_fitness = fitness_scores[current_best_idx]
+
         if current_best_fitness > best_fitness:
             best_fitness = current_best_fitness
             best_chromosome = {k: v.copy() for k, v in population[current_best_idx].items()}
+
         fitness_history.append(best_fitness)
+        print(f"Generazione {gen + 1}/{generations} completata. Miglior Fitness: {best_fitness:.2f}", end='\r')
 
         new_population = [{k: v.copy() for k, v in best_chromosome.items()}]
         while len(new_population) < pop_size:
             p1, p2 = tournament_selection(population, fitness_scores), tournament_selection(population, fitness_scores)
             c1, c2 = crossover(p1, p2)
-            mutate(c1, products, mutation_rate); mutate(c2, products, mutation_rate)
-            repair_chromosome(c1, products); repair_chromosome(c2, products)
+            mutate(c1, products, mutation_rate)
+            mutate(c2, products, mutation_rate)
+
+            # Aggiungiamo ben_req_map al repair per i nuovi figli mutati
+            repair_chromosome(c1, products, ben_priorities_map, ben_req_map)
+            repair_chromosome(c2, products, ben_priorities_map, ben_req_map)
+
             new_population.extend([c1, c2])
+
         population = new_population[:pop_size]
+
+    print("\n")
     return best_chromosome, fitness_history
 
 def plot_convergence(fitness_history: List[float], filename: str = "ai_convergence_plot.png"):
